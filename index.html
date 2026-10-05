@@ -12,18 +12,18 @@
     font-family: system-ui, sans-serif; background: #111; color: #eee;
   }
   main {
-    width: min(760px, calc(100% - 32px)); padding: 28px;
+    width: min(760px, calc(100% - 24px)); padding: 22px; margin: 12px 0;
     background: #1b1b1b; border: 1px solid #333; border-radius: 16px;
   }
-  h1 { margin-top: 0; }
+  h1 { margin-top: 0; font-size: 1.4rem; }
   .drop {
-    display: block; padding: 40px 20px; text-align: center;
+    display: block; padding: 36px 20px; text-align: center;
     border: 2px dashed #555; border-radius: 12px; cursor: pointer;
   }
   .drop:hover { border-color: #aaa; }
   input[type=file] { display: none; }
   button, a.button {
-    display: inline-block; margin: 18px 8px 0 0; padding: 10px 16px;
+    display: inline-block; margin: 16px 8px 0 0; padding: 12px 18px;
     border: 0; border-radius: 9px; background: #eee; color: #111;
     font: inherit; cursor: pointer; text-decoration: none;
   }
@@ -32,17 +32,13 @@
   progress { width: 100%; height: 14px; margin-top: 12px; }
   .info { color: #aaa; font-size: .9rem; line-height: 1.5; }
   .queue { margin-top: 22px; display: grid; gap: 8px; }
-  .item {
-    padding: 12px 14px; border: 1px solid #333; border-radius: 10px;
-    background: #151515;
-  }
-  .item-header {
-    display: flex; justify-content: space-between; gap: 12px;
-  }
+  .item { padding: 12px 14px; border: 1px solid #333; border-radius: 10px; background: #151515; }
+  .item-header { display: flex; justify-content: space-between; gap: 12px; }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .item-status { color: #aaa; font-size: .85rem; margin-top: 5px; }
+  .item-status { color: #aaa; font-size: .85rem; margin-top: 5px; word-break: break-word; }
   .item a { color: inherit; }
   .stats { margin-top: 16px; color: #aaa; font-size: .9rem; }
+  .err { color: #f88; }
 </style>
 </head>
 <body>
@@ -50,9 +46,8 @@
   <h1>Local Video Compressor</h1>
 
   <p class="info">
-    Select multiple videos and compress them locally in your browser.
-    Videos are processed one at a time to keep memory usage under control.
-    Output is never below a 1080p canvas.
+    Compress videos locally in your browser, one at a time to keep memory low.
+    Output is never below a 1080p canvas. Keep this tab open and in the foreground while it runs.
   </p>
 
   <label class="drop" for="files">
@@ -73,10 +68,14 @@
   <div id="stats" class="stats"></div>
 </main>
 
-<script type="module">
-import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm";
-import { fetchFile, toBlobURL } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm";
-import JSZip from "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm";
+<!-- UMD builds (non-module): avoids the broken worker path you get from the +esm bundles -->
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+<script>
+const { FFmpeg } = FFmpegWASM;
+const { fetchFile, toBlobURL } = FFmpegUtil;
 
 const ffmpeg = new FFmpeg();
 
@@ -89,35 +88,28 @@ const progress = document.getElementById("progress");
 const status = document.getElementById("status");
 const stats = document.getElementById("stats");
 
+const LARGE_FILE_MB = 700; // phones commonly run out of WASM memory above this
+
 let files = [];
 let results = [];
 let loaded = false;
 let processing = false;
+let wakeLock = null;
 
 ffmpeg.on("progress", ({ progress: p }) => {
   progress.value = Math.max(0, Math.min(1, p));
   const current = files.find(f => f.status === "processing");
-  status.textContent = current
-    ? `Compressing ${current.file.name}… ${Math.round(p * 100)}%`
-    : "";
+  if (current) status.textContent = `Compressing ${current.file.name}… ${Math.round(p * 100)}%`;
 });
-
-ffmpeg.on("log", ({ message }) => {
-  console.debug("[FFmpeg]", message);
-});
+ffmpeg.on("log", ({ message }) => console.debug("[FFmpeg]", message));
 
 fileInput.addEventListener("change", () => {
   if (!fileInput.files.length) return;
+  for (const item of files) if (item.outputURL) URL.revokeObjectURL(item.outputURL);
 
   files = Array.from(fileInput.files).map((file, index) => ({
-    file,
-    index,
-    status: "waiting",
-    output: null,
-    outputURL: null,
-    error: null
+    file, index, status: "waiting", output: null, outputURL: null, error: null
   }));
-
   results = [];
   downloadAll.hidden = true;
   renderQueue();
@@ -126,11 +118,7 @@ fileInput.addEventListener("change", () => {
 
 clearButton.addEventListener("click", () => {
   if (processing) return;
-
-  for (const item of files) {
-    if (item.outputURL) URL.revokeObjectURL(item.outputURL);
-  }
-
+  for (const item of files) if (item.outputURL) URL.revokeObjectURL(item.outputURL);
   files = [];
   results = [];
   fileInput.value = "";
@@ -144,21 +132,46 @@ clearButton.addEventListener("click", () => {
 
 compressButton.addEventListener("click", compressAll);
 
+function withTimeout(promise, ms, msg) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })
+  ]).finally(() => clearTimeout(t));
+}
+
 async function loadFFmpeg() {
   if (loaded) return;
+  status.textContent = "Loading FFmpeg (~31 MB, cached after first time)…";
 
-  status.textContent = "Loading FFmpeg (~31 MB)…";
+  const coreBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+  const ffmpegBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd";
 
-  const baseURL =
-    "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+  const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
+    toBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
+    toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
+    // The worker chunk must be loaded as a same-origin blob, otherwise load() hangs forever
+    toBlobURL(`${ffmpegBase}/814.ffmpeg.js`, "text/javascript")
+  ]);
 
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm")
-  });
-
+  await withTimeout(
+    ffmpeg.load({ coreURL, wasmURL, classWorkerURL }),
+    60000,
+    "FFmpeg failed to initialise (timed out after 60s)"
+  );
   loaded = true;
 }
+
+async function keepAwake() {
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+}
+function releaseAwake() {
+  try { wakeLock && wakeLock.release(); } catch {}
+  wakeLock = null;
+}
+document.addEventListener("visibilitychange", () => {
+  if (processing && document.visibilityState === "visible") keepAwake();
+});
 
 async function compressAll() {
   if (!files.length || processing) return;
@@ -168,13 +181,21 @@ async function compressAll() {
   clearButton.disabled = true;
   downloadAll.hidden = true;
   progress.hidden = false;
+  progress.value = 0;
+  results = [];
+  await keepAwake();
 
   try {
-    await loadFFmpeg();
+    try {
+      await loadFFmpeg();
+    } catch (error) {
+      console.error(error);
+      status.innerHTML = `<span class="err">Could not load FFmpeg: ${escapeHTML(error?.message || String(error))}</span>`;
+      return;
+    }
 
-    for (let i = 0; i < files.length; i++) {
-      const item = files[i];
-
+    for (const item of files) {
+      if (item.status === "done") continue;
       item.status = "processing";
       renderQueue();
 
@@ -184,13 +205,15 @@ async function compressAll() {
         console.error(error);
         item.status = "failed";
         item.error = error?.message || String(error);
+        // A crash (usually out of memory) leaves the WASM instance unusable: reload it for the next file
+        try { ffmpeg.terminate(); } catch {}
+        loaded = false;
+        try { await loadFFmpeg(); } catch (e) { console.error(e); }
       }
-
       renderQueue();
     }
 
     const successful = files.filter(x => x.output);
-
     if (successful.length) {
       downloadAll.hidden = false;
       status.textContent =
@@ -198,11 +221,11 @@ async function compressAll() {
     } else {
       status.textContent = "No videos were successfully compressed.";
     }
-
     updateStats();
   } finally {
     processing = false;
     progress.hidden = true;
+    releaseAwake();
     updateButtons();
   }
 }
@@ -211,30 +234,28 @@ async function compressOne(item) {
   const inputName = `input_${item.index}${getExtension(item.file.name)}`;
   const outputName = `output_${item.index}.mp4`;
 
+  if (item.file.size / 1048576 > LARGE_FILE_MB) {
+    status.textContent = `${item.file.name} is large; it may fail on low-memory devices…`;
+  }
+
   try {
     await ffmpeg.writeFile(inputName, await fetchFile(item.file));
 
-    /*
-      1080p floor:
-      Landscape -> 1920×1080
-      Portrait  -> 1080×1920
-
-      The original aspect ratio is preserved. The video is fitted inside
-      the 1080p canvas and padded if necessary.
-    */
+    // Landscape -> 1920x1080, portrait -> 1080x1920. Aspect ratio preserved, padded with black.
     const videoFilter =
       "scale=w='if(gt(a,1),1920,1080)':h='if(gt(a,1),1080,1920)':" +
       "force_original_aspect_ratio=decrease:force_divisible_by=2," +
       "pad=w='if(gt(a,1),1920,1080)':h='if(gt(a,1),1080,1920)':" +
-      "x='(ow-iw)/2':y='(oh-ih)/2':color=black";
+      "x='(ow-iw)/2':y='(oh-ih)/2':color=black,format=yuv420p";
 
-    await ffmpeg.exec([
+    const code = await ffmpeg.exec([
       "-i", inputName,
       "-vf", videoFilter,
 
       "-c:v", "libx264",
-      "-preset", "medium",
-      "-crf", "23",
+      "-preset", "veryfast",   // much faster than "medium" in WASM; slightly larger files
+      "-crf", "26",
+      "-tune", "fastdecode",
 
       "-c:a", "aac",
       "-b:a", "128k",
@@ -244,18 +265,18 @@ async function compressOne(item) {
 
       outputName
     ]);
+    if (code !== 0) throw new Error(`FFmpeg exited with code ${code}`);
+
+    // Free the input immediately before reading the output to lower peak memory
+    try { await ffmpeg.deleteFile(inputName); } catch {}
 
     const data = await ffmpeg.readFile(outputName);
-    const blob = new Blob([data.buffer], { type: "video/mp4" });
+    const blob = new Blob([data], { type: "video/mp4" });
 
     item.output = blob;
     item.outputURL = URL.createObjectURL(blob);
     item.status = "done";
-
-    results.push({
-      name: makeOutputName(item.file.name),
-      blob
-    });
+    results.push({ name: makeOutputName(item.file.name), blob });
   } finally {
     try { await ffmpeg.deleteFile(inputName); } catch {}
     try { await ffmpeg.deleteFile(outputName); } catch {}
@@ -264,35 +285,23 @@ async function compressOne(item) {
 
 async function downloadAllAsZip() {
   if (!results.length) return;
-
   downloadAll.textContent = "Building ZIP…";
   downloadAll.style.pointerEvents = "none";
-
   try {
     const zip = new JSZip();
-
-    for (const result of results) {
-      zip.file(result.name, result.blob);
-    }
-
-    const blob = await zip.generateAsync({
-      type: "blob",
-      compression: "STORE"
-    });
-
+    for (const r of results) zip.file(r.name, r.blob);
+    const blob = await zip.generateAsync({ type: "blob", compression: "STORE" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = "compressed-videos.zip";
     a.click();
-
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   } finally {
     downloadAll.textContent = "Download all (.zip)";
     downloadAll.style.pointerEvents = "";
   }
 }
-
 downloadAll.addEventListener("click", downloadAllAsZip);
 
 function renderQueue() {
@@ -301,40 +310,17 @@ function renderQueue() {
   for (const item of files) {
     const row = document.createElement("div");
     row.className = "item";
-
     const sizeMB = item.file.size / 1024 / 1024;
 
     let statusText = "Waiting";
     if (item.status === "processing") statusText = "Compressing…";
+    if (item.status === "failed") statusText = `Failed: ${item.error}`;
     if (item.status === "done") {
       const outputMB = item.output.size / 1024 / 1024;
       const reduction = (1 - item.output.size / item.file.size) * 100;
       statusText =
         `${outputMB.toFixed(1)} MB — ` +
-        (reduction >= 0
-          ? `${reduction.toFixed(1)}% smaller`
-          : `${Math.abs(reduction).toFixed(1)}% larger`);
-
-      const link = document.createElement("a");
-      link.href = item.outputURL;
-      link.download = makeOutputName(item.file.name);
-      link.textContent = "Download";
-      link.style.marginLeft = "10px";
-
-      row.innerHTML = `
-        <div class="item-header">
-          <span class="name">${escapeHTML(item.file.name)}</span>
-          <span>${sizeMB.toFixed(1)} MB</span>
-        </div>
-        <div class="item-status">${escapeHTML(statusText)}</div>
-      `;
-      row.querySelector(".item-status").appendChild(link);
-      queueElement.appendChild(row);
-      continue;
-    }
-
-    if (item.status === "failed") {
-      statusText = `Failed: ${item.error}`;
+        (reduction >= 0 ? `${reduction.toFixed(1)}% smaller` : `${Math.abs(reduction).toFixed(1)}% larger`);
     }
 
     row.innerHTML = `
@@ -345,9 +331,16 @@ function renderQueue() {
       <div class="item-status">${escapeHTML(statusText)}</div>
     `;
 
+    if (item.status === "done") {
+      const link = document.createElement("a");
+      link.href = item.outputURL;
+      link.download = makeOutputName(item.file.name);
+      link.textContent = "Download";
+      link.style.marginLeft = "10px";
+      row.querySelector(".item-status").appendChild(link);
+    }
     queueElement.appendChild(row);
   }
-
   updateStats();
 }
 
@@ -355,10 +348,7 @@ function updateStats() {
   const total = files.length;
   const done = files.filter(x => x.status === "done").length;
   const failed = files.filter(x => x.status === "failed").length;
-
-  stats.textContent = total
-    ? `${done}/${total} complete${failed ? ` · ${failed} failed` : ""}`
-    : "";
+  stats.textContent = total ? `${done}/${total} complete${failed ? ` · ${failed} failed` : ""}` : "";
 }
 
 function updateButtons() {
@@ -372,18 +362,13 @@ function getExtension(name) {
 }
 
 function makeOutputName(name) {
-  const withoutExtension = name.replace(/\.[^.]+$/, "");
-  return `${withoutExtension}-compressed.mp4`;
+  return `${name.replace(/\.[^.]+$/, "")}-compressed.mp4`;
 }
 
 function escapeHTML(value) {
-  return value.replace(/[&<>"']/g, char => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#039;"
-  }[char]));
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+  }[c]));
 }
 </script>
 </body>
