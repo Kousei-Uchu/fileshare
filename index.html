@@ -40,7 +40,7 @@
   .stats { margin-top: 16px; color: #aaa; font-size: .9rem; }
   .err { color: #f88; }
   label.opt { display: block; margin-top: 16px; }
-  select { font: inherit; padding: 6px; background: #151515; color: #eee; border: 1px solid #444; border-radius: 6px; }
+  input[type=number] { font: inherit; width: 90px; padding: 6px; background: #151515; color: #eee; border: 1px solid #444; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -60,12 +60,9 @@
   <input id="files" type="file" accept="video/*" multiple>
 
   <label class="opt info">
-    Quality:
-    <select id="quality">
-      <option value="4000000">Smaller (~4 Mbps)</option>
-      <option value="6000000" selected>Balanced (~6 Mbps)</option>
-      <option value="9000000">Higher (~9 Mbps)</option>
-    </select>
+    Max size per video (MB):
+    <input id="maxSize" type="number" min="1" step="1" value="50" inputmode="numeric">
+    <br>Bitrate is calculated from each video's length to land just under this. Output is 15 fps with no audio. Leave blank for a fixed ~4.5 Mbps.
   </label>
 
   <div>
@@ -88,7 +85,12 @@ import {
 } from "https://cdn.jsdelivr.net/npm/mediabunny@1/+esm";
 
 const fileInput = document.getElementById("files");
-const qualitySelect = document.getElementById("quality");
+const maxSizeInput = document.getElementById("maxSize");
+const FPS = 15;
+const MIN_VIDEO_BITRATE = 150000;
+// Bits per pixel per frame that's plenty for H.264 hardware encoders. Combined with the
+// frame rate and canvas size it gives the highest bitrate worth spending at 15 fps.
+const MAX_BITS_PER_PIXEL = 0.15;
 const compressButton = document.getElementById("compress");
 const clearButton = document.getElementById("clear");
 const downloadAll = document.getElementById("downloadAll");
@@ -162,6 +164,7 @@ async function compressAll() {
     for (const item of files) {
       item.status = "processing";
       item.error = null;
+      item.note = null;
       renderQueue();
       try {
         await compressOne(item);
@@ -203,37 +206,74 @@ async function compressOne(item) {
     const width = landscape ? 1920 : 1080;
     const height = landscape ? 1080 : 1920;
 
-    const output = new Output({
-      format: new Mp4OutputFormat({ fastStart: "in-memory" }),
-      target: new BufferTarget()
-    });
+    const duration = await input.computeDuration();
 
-    const conversion = await Conversion.init({
-      input,
-      output,
-      video: {
-        width,
-        height,
-        fit: "contain",
-        codec: "avc",
-        bitrate: Number(qualitySelect.value),
-        hardwareAcceleration: "prefer-hardware"
+    const maxMB = parseFloat(maxSizeInput.value);
+    const maxBytes = maxMB > 0 ? maxMB * 1024 * 1024 : null;
+
+    // Highest bitrate worth using for this canvas at 15 fps (more is wasted bytes).
+    const usefulCeiling = width * height * FPS * MAX_BITS_PER_PIXEL;
+
+    // No audio, so the whole size budget goes to video. 5% reserved for container overhead + encoder wobble.
+    let bitrate = Math.min(6000000, usefulCeiling);
+    if (maxBytes && duration > 0) {
+      bitrate = (maxBytes * 0.95 * 8) / duration;
+      if (bitrate < MIN_VIDEO_BITRATE) {
+        item.note = "very tight size limit, quality will be poor";
       }
-      // Audio is left alone: AAC is copied as-is, anything else is transcoded automatically.
-    });
-
-    if (!conversion.isValid) {
-      throw new Error("Can't convert this file in this browser (unsupported codec).");
+      bitrate = Math.max(MIN_VIDEO_BITRATE, Math.min(usefulCeiling, bitrate));
     }
 
-    conversion.onProgress = (p) => {
-      progress.value = p;
-      status.textContent = `Compressing ${item.file.name}… ${Math.round(p * 100)}%`;
-    };
+    let blob = null;
+    const MAX_ATTEMPTS = maxBytes ? 3 : 1;
 
-    await conversion.execute();
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const output = new Output({
+        format: new Mp4OutputFormat({ fastStart: "in-memory" }),
+        target: new BufferTarget()
+      });
 
-    const blob = new Blob([output.target.buffer], { type: "video/mp4" });
+      const conversion = await Conversion.init({
+        input,
+        output,
+        video: {
+          width,
+          height,
+          fit: "contain",
+          codec: "avc",
+          bitrate: Math.round(bitrate),
+          frameRate: FPS,
+          hardwareAcceleration: "prefer-hardware"
+        },
+        audio: { discard: true }
+      });
+
+      if (!conversion.isValid) {
+        throw new Error("Can't convert this file in this browser (unsupported codec).");
+      }
+
+      conversion.onProgress = (p) => {
+        progress.value = p;
+        status.textContent =
+          `Compressing ${item.file.name}` +
+          (attempt > 1 ? ` (retry ${attempt - 1}, ${(bitrate / 1e6).toFixed(2)} Mbps)` : ` (${(bitrate / 1e6).toFixed(2)} Mbps)`) +
+          `… ${Math.round(p * 100)}%`;
+      };
+
+      await conversion.execute();
+      blob = new Blob([output.target.buffer], { type: "video/mp4" });
+
+      if (!maxBytes || blob.size <= maxBytes) break;
+
+      // Encoder overshot: scale the bitrate down by how far over we were, with a little extra margin.
+      const lowered = bitrate * (maxBytes / blob.size) * 0.93;
+      if (lowered < MIN_VIDEO_BITRATE || attempt === MAX_ATTEMPTS) {
+        item.note = `couldn't get under ${maxMB} MB (got ${(blob.size / 1048576).toFixed(1)} MB)`;
+        break;
+      }
+      bitrate = lowered;
+    }
+
     item.output = blob;
     item.outputURL = URL.createObjectURL(blob);
     item.status = "done";
@@ -280,7 +320,8 @@ function renderQueue() {
       const reduction = (1 - item.output.size / item.file.size) * 100;
       statusText =
         `${outputMB.toFixed(1)} MB — ` +
-        (reduction >= 0 ? `${reduction.toFixed(1)}% smaller` : `${Math.abs(reduction).toFixed(1)}% larger`);
+        (reduction >= 0 ? `${reduction.toFixed(1)}% smaller` : `${Math.abs(reduction).toFixed(1)}% larger`) +
+        (item.note ? ` · ${item.note}` : "");
     }
 
     row.innerHTML = `
