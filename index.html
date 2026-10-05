@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Local Video Compressor</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: system-ui, sans-serif; background: #111; color: #eee;
+  }
+  main {
+    width: min(760px, calc(100% - 32px)); padding: 28px;
+    background: #1b1b1b; border: 1px solid #333; border-radius: 16px;
+  }
+  h1 { margin-top: 0; }
+  .drop {
+    display: block; padding: 40px 20px; text-align: center;
+    border: 2px dashed #555; border-radius: 12px; cursor: pointer;
+  }
+  .drop:hover { border-color: #aaa; }
+  input[type=file] { display: none; }
+  button, a.button {
+    display: inline-block; margin: 18px 8px 0 0; padding: 10px 16px;
+    border: 0; border-radius: 9px; background: #eee; color: #111;
+    font: inherit; cursor: pointer; text-decoration: none;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #status { margin-top: 18px; white-space: pre-wrap; }
+  progress { width: 100%; height: 14px; margin-top: 12px; }
+  .info { color: #aaa; font-size: .9rem; line-height: 1.5; }
+  .queue { margin-top: 22px; display: grid; gap: 8px; }
+  .item {
+    padding: 12px 14px; border: 1px solid #333; border-radius: 10px;
+    background: #151515;
+  }
+  .item-header {
+    display: flex; justify-content: space-between; gap: 12px;
+  }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item-status { color: #aaa; font-size: .85rem; margin-top: 5px; }
+  .item a { color: inherit; }
+  .stats { margin-top: 16px; color: #aaa; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Local Video Compressor</h1>
+
+  <p class="info">
+    Select multiple videos and compress them locally in your browser.
+    Videos are processed one at a time to keep memory usage under control.
+    Output is never below a 1080p canvas.
+  </p>
+
+  <label class="drop" for="files">
+    <strong>Choose videos</strong><br>
+    <span class="info">You can select multiple files at once</span>
+  </label>
+  <input id="files" type="file" accept="video/*" multiple>
+
+  <div>
+    <button id="compress" disabled>Compress all</button>
+    <button id="clear" disabled>Clear queue</button>
+    <a id="downloadAll" class="button" hidden>Download all (.zip)</a>
+  </div>
+
+  <div id="queue" class="queue"></div>
+  <progress id="progress" value="0" max="1" hidden></progress>
+  <div id="status"></div>
+  <div id="stats" class="stats"></div>
+</main>
+
+<script type="module">
+import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm";
+import { fetchFile, toBlobURL } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm";
+import JSZip from "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm";
+
+const ffmpeg = new FFmpeg();
+
+const fileInput = document.getElementById("files");
+const compressButton = document.getElementById("compress");
+const clearButton = document.getElementById("clear");
+const downloadAll = document.getElementById("downloadAll");
+const queueElement = document.getElementById("queue");
+const progress = document.getElementById("progress");
+const status = document.getElementById("status");
+const stats = document.getElementById("stats");
+
+let files = [];
+let results = [];
+let loaded = false;
+let processing = false;
+
+ffmpeg.on("progress", ({ progress: p }) => {
+  progress.value = Math.max(0, Math.min(1, p));
+  const current = files.find(f => f.status === "processing");
+  status.textContent = current
+    ? `Compressing ${current.file.name}… ${Math.round(p * 100)}%`
+    : "";
+});
+
+ffmpeg.on("log", ({ message }) => {
+  console.debug("[FFmpeg]", message);
+});
+
+fileInput.addEventListener("change", () => {
+  if (!fileInput.files.length) return;
+
+  files = Array.from(fileInput.files).map((file, index) => ({
+    file,
+    index,
+    status: "waiting",
+    output: null,
+    outputURL: null,
+    error: null
+  }));
+
+  results = [];
+  downloadAll.hidden = true;
+  renderQueue();
+  updateButtons();
+});
+
+clearButton.addEventListener("click", () => {
+  if (processing) return;
+
+  for (const item of files) {
+    if (item.outputURL) URL.revokeObjectURL(item.outputURL);
+  }
+
+  files = [];
+  results = [];
+  fileInput.value = "";
+  queueElement.innerHTML = "";
+  status.textContent = "";
+  stats.textContent = "";
+  downloadAll.hidden = true;
+  progress.hidden = true;
+  updateButtons();
+});
+
+compressButton.addEventListener("click", compressAll);
+
+async function loadFFmpeg() {
+  if (loaded) return;
+
+  status.textContent = "Loading FFmpeg (~31 MB)…";
+
+  const baseURL =
+    "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm")
+  });
+
+  loaded = true;
+}
+
+async function compressAll() {
+  if (!files.length || processing) return;
+
+  processing = true;
+  compressButton.disabled = true;
+  clearButton.disabled = true;
+  downloadAll.hidden = true;
+  progress.hidden = false;
+
+  try {
+    await loadFFmpeg();
+
+    for (let i = 0; i < files.length; i++) {
+      const item = files[i];
+
+      item.status = "processing";
+      renderQueue();
+
+      try {
+        await compressOne(item);
+      } catch (error) {
+        console.error(error);
+        item.status = "failed";
+        item.error = error?.message || String(error);
+      }
+
+      renderQueue();
+    }
+
+    const successful = files.filter(x => x.output);
+
+    if (successful.length) {
+      downloadAll.hidden = false;
+      status.textContent =
+        `Finished ${successful.length} of ${files.length} video${files.length === 1 ? "" : "s"}.`;
+    } else {
+      status.textContent = "No videos were successfully compressed.";
+    }
+
+    updateStats();
+  } finally {
+    processing = false;
+    progress.hidden = true;
+    updateButtons();
+  }
+}
+
+async function compressOne(item) {
+  const inputName = `input_${item.index}${getExtension(item.file.name)}`;
+  const outputName = `output_${item.index}.mp4`;
+
+  try {
+    await ffmpeg.writeFile(inputName, await fetchFile(item.file));
+
+    /*
+      1080p floor:
+      Landscape -> 1920×1080
+      Portrait  -> 1080×1920
+
+      The original aspect ratio is preserved. The video is fitted inside
+      the 1080p canvas and padded if necessary.
+    */
+    const videoFilter =
+      "scale=w='if(gt(a,1),1920,1080)':h='if(gt(a,1),1080,1920)':" +
+      "force_original_aspect_ratio=decrease:force_divisible_by=2," +
+      "pad=w='if(gt(a,1),1920,1080)':h='if(gt(a,1),1080,1920)':" +
+      "x='(ow-iw)/2':y='(oh-ih)/2':color=black";
+
+    await ffmpeg.exec([
+      "-i", inputName,
+      "-vf", videoFilter,
+
+      "-c:v", "libx264",
+      "-preset", "medium",
+      "-crf", "23",
+
+      "-c:a", "aac",
+      "-b:a", "128k",
+
+      "-movflags", "+faststart",
+      "-map_metadata", "0",
+
+      outputName
+    ]);
+
+    const data = await ffmpeg.readFile(outputName);
+    const blob = new Blob([data.buffer], { type: "video/mp4" });
+
+    item.output = blob;
+    item.outputURL = URL.createObjectURL(blob);
+    item.status = "done";
+
+    results.push({
+      name: makeOutputName(item.file.name),
+      blob
+    });
+  } finally {
+    try { await ffmpeg.deleteFile(inputName); } catch {}
+    try { await ffmpeg.deleteFile(outputName); } catch {}
+  }
+}
+
+async function downloadAllAsZip() {
+  if (!results.length) return;
+
+  downloadAll.textContent = "Building ZIP…";
+  downloadAll.style.pointerEvents = "none";
+
+  try {
+    const zip = new JSZip();
+
+    for (const result of results) {
+      zip.file(result.name, result.blob);
+    }
+
+    const blob = await zip.generateAsync({
+      type: "blob",
+      compression: "STORE"
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "compressed-videos.zip";
+    a.click();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } finally {
+    downloadAll.textContent = "Download all (.zip)";
+    downloadAll.style.pointerEvents = "";
+  }
+}
+
+downloadAll.addEventListener("click", downloadAllAsZip);
+
+function renderQueue() {
+  queueElement.innerHTML = "";
+
+  for (const item of files) {
+    const row = document.createElement("div");
+    row.className = "item";
+
+    const sizeMB = item.file.size / 1024 / 1024;
+
+    let statusText = "Waiting";
+    if (item.status === "processing") statusText = "Compressing…";
+    if (item.status === "done") {
+      const outputMB = item.output.size / 1024 / 1024;
+      const reduction = (1 - item.output.size / item.file.size) * 100;
+      statusText =
+        `${outputMB.toFixed(1)} MB — ` +
+        (reduction >= 0
+          ? `${reduction.toFixed(1)}% smaller`
+          : `${Math.abs(reduction).toFixed(1)}% larger`);
+
+      const link = document.createElement("a");
+      link.href = item.outputURL;
+      link.download = makeOutputName(item.file.name);
+      link.textContent = "Download";
+      link.style.marginLeft = "10px";
+
+      row.innerHTML = `
+        <div class="item-header">
+          <span class="name">${escapeHTML(item.file.name)}</span>
+          <span>${sizeMB.toFixed(1)} MB</span>
+        </div>
+        <div class="item-status">${escapeHTML(statusText)}</div>
+      `;
+      row.querySelector(".item-status").appendChild(link);
+      queueElement.appendChild(row);
+      continue;
+    }
+
+    if (item.status === "failed") {
+      statusText = `Failed: ${item.error}`;
+    }
+
+    row.innerHTML = `
+      <div class="item-header">
+        <span class="name">${escapeHTML(item.file.name)}</span>
+        <span>${sizeMB.toFixed(1)} MB</span>
+      </div>
+      <div class="item-status">${escapeHTML(statusText)}</div>
+    `;
+
+    queueElement.appendChild(row);
+  }
+
+  updateStats();
+}
+
+function updateStats() {
+  const total = files.length;
+  const done = files.filter(x => x.status === "done").length;
+  const failed = files.filter(x => x.status === "failed").length;
+
+  stats.textContent = total
+    ? `${done}/${total} complete${failed ? ` · ${failed} failed` : ""}`
+    : "";
+}
+
+function updateButtons() {
+  compressButton.disabled = !files.length || processing;
+  clearButton.disabled = !files.length || processing;
+}
+
+function getExtension(name) {
+  const match = name.match(/\.[^.]+$/);
+  return match ? match[0].toLowerCase() : ".mp4";
+}
+
+function makeOutputName(name) {
+  const withoutExtension = name.replace(/\.[^.]+$/, "");
+  return `${withoutExtension}-compressed.mp4`;
+}
+
+function escapeHTML(value) {
+  return value.replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
+  }[char]));
+}
+</script>
+</body>
+</html>
