@@ -39,6 +39,8 @@
   .item a { color: inherit; }
   .stats { margin-top: 16px; color: #aaa; font-size: .9rem; }
   .err { color: #f88; }
+  label.opt { display: block; margin-top: 16px; }
+  select { font: inherit; padding: 6px; background: #151515; color: #eee; border: 1px solid #444; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -46,8 +48,9 @@
   <h1>Local Video Compressor</h1>
 
   <p class="info">
-    Compress videos locally in your browser, one at a time to keep memory low.
-    Output is never below a 1080p canvas. Keep this tab open and in the foreground while it runs.
+    Compresses videos on-device using your browser's hardware video encoder (WebCodecs),
+    so it's many times faster than software FFmpeg. Output is never below a 1080p canvas.
+    Keep this tab open and in the foreground while it runs.
   </p>
 
   <label class="drop" for="files">
@@ -55,6 +58,15 @@
     <span class="info">You can select multiple files at once</span>
   </label>
   <input id="files" type="file" accept="video/*" multiple>
+
+  <label class="opt info">
+    Quality:
+    <select id="quality">
+      <option value="4000000">Smaller (~4 Mbps)</option>
+      <option value="6000000" selected>Balanced (~6 Mbps)</option>
+      <option value="9000000">Higher (~9 Mbps)</option>
+    </select>
+  </label>
 
   <div>
     <button id="compress" disabled>Compress all</button>
@@ -68,18 +80,15 @@
   <div id="stats" class="stats"></div>
 </main>
 
-<!-- UMD builds (non-module): avoids the broken worker path you get from the +esm bundles -->
-<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
-<script>
-const { FFmpeg } = FFmpegWASM;
-const { fetchFile, toBlobURL } = FFmpegUtil;
-
-const ffmpeg = new FFmpeg();
+<script type="module">
+import {
+  Input, Output, Conversion, ALL_FORMATS, BlobSource, Mp4OutputFormat, BufferTarget
+} from "https://cdn.jsdelivr.net/npm/mediabunny@1/+esm";
 
 const fileInput = document.getElementById("files");
+const qualitySelect = document.getElementById("quality");
 const compressButton = document.getElementById("compress");
 const clearButton = document.getElementById("clear");
 const downloadAll = document.getElementById("downloadAll");
@@ -88,20 +97,14 @@ const progress = document.getElementById("progress");
 const status = document.getElementById("status");
 const stats = document.getElementById("stats");
 
-const LARGE_FILE_MB = 700; // phones commonly run out of WASM memory above this
-
 let files = [];
 let results = [];
-let loaded = false;
 let processing = false;
 let wakeLock = null;
 
-ffmpeg.on("progress", ({ progress: p }) => {
-  progress.value = Math.max(0, Math.min(1, p));
-  const current = files.find(f => f.status === "processing");
-  if (current) status.textContent = `Compressing ${current.file.name}… ${Math.round(p * 100)}%`;
-});
-ffmpeg.on("log", ({ message }) => console.debug("[FFmpeg]", message));
+if (!("VideoEncoder" in window)) {
+  status.innerHTML = '<span class="err">This browser has no WebCodecs support (needs Chrome/Edge/Safari 16.4+/recent Firefox).</span>';
+}
 
 fileInput.addEventListener("change", () => {
   if (!fileInput.files.length) return;
@@ -132,37 +135,6 @@ clearButton.addEventListener("click", () => {
 
 compressButton.addEventListener("click", compressAll);
 
-function withTimeout(promise, ms, msg) {
-  let t;
-  return Promise.race([
-    promise,
-    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })
-  ]).finally(() => clearTimeout(t));
-}
-
-async function loadFFmpeg() {
-  if (loaded) return;
-  status.textContent = "Loading FFmpeg (~31 MB, cached after first time)…";
-
-  // The worker is a module worker, which can't importScripts(), so it needs the ESM core build
-  const coreBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
-  const ffmpegBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd";
-
-  const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
-    toBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
-    toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
-    // The worker chunk must be loaded as a same-origin blob, otherwise load() hangs forever
-    toBlobURL(`${ffmpegBase}/814.ffmpeg.js`, "text/javascript")
-  ]);
-
-  await withTimeout(
-    ffmpeg.load({ coreURL, wasmURL, classWorkerURL }),
-    60000,
-    "FFmpeg failed to initialise (timed out after 60s)"
-  );
-  loaded = true;
-}
-
 async function keepAwake() {
   try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
 }
@@ -187,29 +159,16 @@ async function compressAll() {
   await keepAwake();
 
   try {
-    try {
-      await loadFFmpeg();
-    } catch (error) {
-      console.error(error);
-      status.innerHTML = `<span class="err">Could not load FFmpeg: ${escapeHTML(error?.message || String(error))}</span>`;
-      return;
-    }
-
     for (const item of files) {
-      if (item.status === "done") continue;
       item.status = "processing";
+      item.error = null;
       renderQueue();
-
       try {
         await compressOne(item);
       } catch (error) {
         console.error(error);
         item.status = "failed";
         item.error = error?.message || String(error);
-        // A crash (usually out of memory) leaves the WASM instance unusable: reload it for the next file
-        try { ffmpeg.terminate(); } catch {}
-        loaded = false;
-        try { await loadFFmpeg(); } catch (e) { console.error(e); }
       }
       renderQueue();
     }
@@ -232,55 +191,55 @@ async function compressAll() {
 }
 
 async function compressOne(item) {
-  const inputName = `input_${item.index}${getExtension(item.file.name)}`;
-  const outputName = `output_${item.index}.mp4`;
-
-  if (item.file.size / 1048576 > LARGE_FILE_MB) {
-    status.textContent = `${item.file.name} is large; it may fail on low-memory devices…`;
-  }
+  const input = new Input({ source: new BlobSource(item.file), formats: ALL_FORMATS });
 
   try {
-    await ffmpeg.writeFile(inputName, await fetchFile(item.file));
+    const track = await input.getPrimaryVideoTrack();
+    if (!track) throw new Error("No video track found");
 
-    // Landscape -> 1920x1080, portrait -> 1080x1920. Aspect ratio preserved, padded with black.
-    const videoFilter =
-      "scale=w='if(gt(a,1),1920,1080)':h='if(gt(a,1),1080,1920)':" +
-      "force_original_aspect_ratio=decrease:force_divisible_by=2," +
-      "pad=w='if(gt(a,1),1920,1080)':h='if(gt(a,1),1080,1920)':" +
-      "x='(ow-iw)/2':y='(oh-ih)/2':color=black,format=yuv420p";
+    // 1080p floor: landscape -> 1920x1080, portrait/square -> 1080x1920.
+    // Aspect ratio preserved; padded with black ("contain").
+    const landscape = track.displayWidth > track.displayHeight;
+    const width = landscape ? 1920 : 1080;
+    const height = landscape ? 1080 : 1920;
 
-    const code = await ffmpeg.exec([
-      "-i", inputName,
-      "-vf", videoFilter,
+    const output = new Output({
+      format: new Mp4OutputFormat({ fastStart: "in-memory" }),
+      target: new BufferTarget()
+    });
 
-      "-c:v", "libx264",
-      "-preset", "veryfast",   // much faster than "medium" in WASM; slightly larger files
-      "-crf", "26",
-      "-tune", "fastdecode",
+    const conversion = await Conversion.init({
+      input,
+      output,
+      video: {
+        width,
+        height,
+        fit: "contain",
+        codec: "avc",
+        bitrate: Number(qualitySelect.value),
+        hardwareAcceleration: "prefer-hardware"
+      }
+      // Audio is left alone: AAC is copied as-is, anything else is transcoded automatically.
+    });
 
-      "-c:a", "aac",
-      "-b:a", "128k",
+    if (!conversion.isValid) {
+      throw new Error("Can't convert this file in this browser (unsupported codec).");
+    }
 
-      "-movflags", "+faststart",
-      "-map_metadata", "0",
+    conversion.onProgress = (p) => {
+      progress.value = p;
+      status.textContent = `Compressing ${item.file.name}… ${Math.round(p * 100)}%`;
+    };
 
-      outputName
-    ]);
-    if (code !== 0) throw new Error(`FFmpeg exited with code ${code}`);
+    await conversion.execute();
 
-    // Free the input immediately before reading the output to lower peak memory
-    try { await ffmpeg.deleteFile(inputName); } catch {}
-
-    const data = await ffmpeg.readFile(outputName);
-    const blob = new Blob([data], { type: "video/mp4" });
-
+    const blob = new Blob([output.target.buffer], { type: "video/mp4" });
     item.output = blob;
     item.outputURL = URL.createObjectURL(blob);
     item.status = "done";
     results.push({ name: makeOutputName(item.file.name), blob });
   } finally {
-    try { await ffmpeg.deleteFile(inputName); } catch {}
-    try { await ffmpeg.deleteFile(outputName); } catch {}
+    try { input.dispose?.(); } catch {}
   }
 }
 
@@ -355,11 +314,6 @@ function updateStats() {
 function updateButtons() {
   compressButton.disabled = !files.length || processing;
   clearButton.disabled = !files.length || processing;
-}
-
-function getExtension(name) {
-  const match = name.match(/\.[^.]+$/);
-  return match ? match[0].toLowerCase() : ".mp4";
 }
 
 function makeOutputName(name) {
