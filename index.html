@@ -144,7 +144,8 @@ async function loadFFmpeg() {
   if (loaded) return;
   status.textContent = "Loading FFmpeg (~31 MB, cached after first time)…";
 
-  const coreBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+  // The worker is a module worker, which can't importScripts(), so it needs the ESM core build
+  const coreBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
   const ffmpegBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd";
 
   const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
